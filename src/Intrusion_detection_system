@@ -1,0 +1,275 @@
+#include <pcap.h>
+/*Brings in libpcap/Npcap APIs (packet capture functions).*/
+#include <iostream>
+/*For printing to console using cout, errors with cerr, and taking input cin.*/
+#include <map>
+/*For printing to console using cout, errors with cerr, and taking input cin.*/
+#include <string>
+/*string: text*/
+#include <ctime>
+/*ctime: time functions (time(nullptr))*/
+#include <fstream>
+/*#include <fstream>*/
+#include <set>
+/*set: stores unique values (no duplicates)*/
+
+using namespace std;
+
+// --- Simple log ---
+ofstream logFile("ids_alerts.log");
+/*ofstream here because we want to just write not read from the ids_alerts.log*/
+/*Opens a file named ids_alerts.log for writing.*/
+void logAlert(const string& msg) {
+    logFile << msg << endl;
+    cout << "\033[31m" << msg << "\033[0m" << endl;
+}
+/*logAlert is a helper function.
+
+It does two things:
+
+we wrote logFile instead of cout bc to write alert message to log file directly
+
+prints it in red using terminal escape codes:
+
+\033[31m = red
+
+\033[0m = reset color back to normal
+\033 is escape character, 033 is octal 31 is for red color and 0 is for returning back to normal color
+*/
+
+// --- Port-scan tracking: unique ports per source IP in a time window ---
+map<string, set<int>> uniquePorts;   // srcIP -> set of dstPorts
+/*we used map here because it saves date per source IP like a dictionary, we used <> bc, it's
+a C++ template without it we couldn't have even written the things inside map, bc
+map supports <>
+uniquePorts - means for each srcIP stores a set of destinations ports it has contacted.*/
+map<string, time_t> windowStart;     // srcIP -> current window start time(10s)
+map<string, time_t> lastAlertTime;   // srcIP -> last time we alerted (cooldown) so we don't spam alerts
+
+// Tweak these if needed
+static const int WINDOW_SECONDS = 10;          // how long to watch per IP
+static const int PORTSCAN_THRESHOLD = 20;      /*unique ports to hit in window to call "scan",
+                                                 here to hit in 20 ports in 10s*/ 
+static const int ALERT_COOLDOWN_SECONDS = 10;  // minimum time between alerts per IP
+
+void packetHandler(u_char* user, const struct pcap_pkthdr* header, const u_char* packet) {
+    /*Npcap will call this function for every captured packet.
+    u_char = unsigned character
+    user is here just like a extra container, we are not using it in this code, but it's 
+    necessary to include it here of libcap, it can contain thresholds, interface name, counters.
+    pcap_pkthdr = a pointer to a struct that contains packet metadata like: 
+    i) captured / actual length (len, caplen)
+    ii) timestamp of capture
+    packet = pointer to the actual packet bytes.*/
+
+    const u_char* ipHeader = packet + 14;
+    /*Usually Ethernet header is 14 bytes (works for normal Ethernet/Wi-Fi capture from Npcap)
+    so if we consider packet = 0 bytes(starting) then adding 14 skips the ethernet part and 
+    lands us into the IPv4*/ 
+    // Basic IPv4 sanity check (version should be 4)
+    int version = (ipHeader[0] >> 4) & 0x0F;
+    /*IPv4 Version = 4 → decimal 4 in binary is 0100
+
+A normal IPv4 header with no options has length 20 bytes
+IHL is counted in 32-bit words (4 bytes)
+20 bytes ÷ 4 = 5 → decimal 5 in binary is 0101
+ >> = means shifting 4 bites right and replacing with 0's, basically chopping off the 
+ 4 rightmost digits
+and & 0x0F = Hex digits map to 4 bits each:
+F in hex = decimal 15
+15 in binary = 1111
+So 0x0F means: 0000 1111 (the leading 0 is another 4 bits). even if the shift is done by >>
+we use 0x0F as a sure guarantee that the shift has been done
+*/
+    if (version != 4) return;
+    /*if not IPV4 the code stops running, as the whole code is written with equivalence to
+    IPV4 */
+
+    string srcIP = to_string(ipHeader[12]) + "." +
+                   to_string(ipHeader[13]) + "." +
+                   to_string(ipHeader[14]) + "." +
+                   to_string(ipHeader[15]);
+    /*we got to_string from the <string>/<iostream> library
+    Let's assume the ip from the source is 192.168.1.1
+    then ipHeader[12] = 192
+    then ipHeader[13] = 168
+            .....
+     to string converts the number into text . "." puts the dots in between each byte to make 
+     it a complete ip address*/               
+
+    int protocol = ipHeader[9];
+    if (protocol != 6 && protocol != 17) return;// Only TCP(6) or UDP(17)
+    /*According to the IPv4 header standard ipHeader[9] = the protocol field where we will
+    search protocols (TCP,UDP)
+    Protocol = 6 = TCP and Protocol = 17 = UDP */
+    // IP header length (IHL) is in 32-bit words
+    int ipHeaderLen = (ipHeader[0] & 0x0F) * 4;
+    /* Let's assume 
+     0100 0101   (ipHeader[0])
+    & 0000 1111   (0x0F)
+    = 0000 0101 , 0101 binary to decimal = 5, 5*4 = 20 bytes */
+    const u_char* tcpUDP = ipHeader + ipHeaderLen;
+    /*we are setting the value of tcpUDP to the start of the ipHeader, directly writing it
+    with the ipHeaderLen by adding it 
+    The order of the packets are : 
+    [Ethernet header][IP header (variable size)][TCP/UDP header][payload]
+    so by adding ipHeaderLen we are navigating to the TCP/UDP header part*/
+    int srcPort = (tcpUDP[0] << 8) + tcpUDP[1];
+    int dstPort = (tcpUDP[2] << 8) + tcpUDP[3];
+    /*usually a port number is 2 bytes = high byte + low byte  but tcpUDP port uses 1 byte at
+    a time that's why we need to combine 2 bytes tcp [0] = src port high byte,
+    tcp [1] = low byte , similarly [2] is high port and [3] is low byte, we use 
+    << for shifting and + for adding both bytes.*/
+
+    // --- RULE 1: Suspicious common admin ports ---
+    if (dstPort == 22 || dstPort == 23 || dstPort == 3389) {
+        logAlert("[ALERT] Suspicious port access: IP=" + srcIP + " -> Port=" + to_string(dstPort));
+    }
+    /* 22 = ssh , 23 = telnet, 3389 = RDP
+    to_string converts the dstPort num into text for output */
+
+    // --- RULE 2: Real Port Scan Detection (unique ports in window) ---
+    time_t now = time(nullptr);
+    /*time() can optionally write the current time into a variable you pass
+    by pointer. Passing nullptr means : dont store it anywhere else, just return
+    the time.*/
+
+    if (windowStart[srcIP] == 0) windowStart[srcIP] = now;
+    /*If this source IP has never been seen, start its window now.*/
+    // If window expired, reset the per-IP tracking
+    if (now - windowStart[srcIP] > WINDOW_SECONDS) {
+    /*windowStart[srcIP] counts the current time and if it's greater than the 
+    declared time of WINDOW_SECONDS which is 10s then : */
+        uniquePorts[srcIP].clear();
+        /*tracks unique ports hit per ip and then it clears it. "." here calling
+        this function on this object*/
+        windowStart[srcIP] = now;
+    }
+    
+
+    uniquePorts[srcIP].insert(dstPort);
+
+    // If many unique ports hit quickly -> alert (with cooldown)
+    if ((int)uniquePorts[srcIP].size() >= PORTSCAN_THRESHOLD)
+    /*uniquePorts[srcIP].size = how many ports are engaged in attack
+    so this means that if the no of ports >= PORTSCAN_THRESHOLD = 20s*/ 
+    {
+        if (now - lastAlertTime[srcIP] >= ALERT_COOLDOWN_SECONDS) {
+            logAlert("[ALERT] Possible PORT SCAN by " + srcIP +
+                     " (unique ports in " + to_string(WINDOW_SECONDS) +
+                     "s = " + to_string(uniquePorts[srcIP].size()) + ")");
+            lastAlertTime[srcIP] = now;
+            /*stores the current time in the map for that IP
+            Later, the code checks lastAlertTime[srcIP] = now to avoid 
+            sending another msg too soon.*/
+        }
+    }
+
+    // --- RULE 3: Large packet (rough flood indicator) ---
+    if (header->len > 1500) {
+        logAlert("[ALERT] Large packet (" + to_string(header->len) + " bytes) from " + srcIP);
+    }
+    /*we got header from pcap library and len is a field inside header
+    " -> " =  bc header is pointer and then it means go to the obj this
+    pointer points to, then across the field */
+
+    // Occasional normal traffic line (so you know it’s alive)
+    if (rand() % 50 == 0) 
+    /*rand() always a random integer like 0, 3535, 12982
+    we have to always run this when the remainder after dividing by 50 is 0, which
+    happens 1 out of 50 times so it prints normal traffic occasionally*/
+    {
+        cout << "\033[32mNormal traffic: " << srcIP
+             << " -> Port " << dstPort
+             << " (" << header->len << " bytes)\033[0m" << endl;
+    }
+}
+
+int main() {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    /*we got PCAP_ERRBUF_SIZE from pcap, it's a constant which tells us the correct 
+    buffer size for error msgs that pcap functions write into errbuf */
+    pcap_if_t* alldevs = nullptr;
+    /* we got pcap_if_t* from pcap header and a " * " after that bc pcap_findalldevs()
+    it doesn't return one device it returns many devices, so it points to the first node
+    in the chain, it's currently set to nullptr bc if pcap_findalldevs fails we don't have
+    a garbage value in alldevs " */
+    cout << "=== Real Network IDS (Windows + Npcap) ===\n";
+
+    if (pcap_findalldevs(&alldevs, errbuf) == -1 || !alldevs) {
+        cerr << "Error finding devices: " << errbuf << endl;
+        return 1;
+        /*cerr is used to print in error output usually used for problems*/
+    }
+    /* if loop checks to find the names of all devices by &alldevs and errbuf checks and
+    writes an error msg if something fails and all these == -1 means it failed or !alldevs means
+    alldevs is null , in both of these cases it should return error. */
+
+    // List devices
+    cout << "\nAvailable Network Interfaces:\n";
+    int idx = 0;
+    for (pcap_if_t* d = alldevs; d != nullptr; d = d->next) {
+        cout << "[" << idx << "] " << d->name;
+        if (d->description) cout << " | " << d->description;
+        /* (d->description) is shorthand for : if (d->description != nullptr) */
+        cout << endl;
+        idx++;
+    }
+    /*d is just a variable which gradually moves to the next pointer, it is a pointer to 
+    pcap_if_t struct
+    full form of (d->description = d->description != nullptr), so basically if description exists
+    print the next description*/
+
+    cout << "\nSelect interface number (try Wi-Fi/Ethernet): ";
+    int choice = 0;
+    cin >> choice;
+
+    // Pick chosen device
+    pcap_if_t* device = alldevs;
+    for (int i = 0; i < choice && device != nullptr; i++) device = device->next;
+
+    if (!device) {
+        cerr << "Invalid selection.\n";
+        pcap_freealldevs(alldevs);
+        return 1;
+    }
+
+    cout << "\nUsing interface: " << device->name << endl;
+    if (device->description) cout << "Description: " << device->description << endl;
+
+    // Open device
+    pcap_t* handle = pcap_open_live(
+        device->name,
+        65536,
+        /*this number or 64KB is used bc it's big enough to capture basically any
+        normal packet fully, so we don't miss any headers/payload.*/
+        1,
+        /*tells the card/driver capture everything you see on the network*/
+        1000,
+        /*1000 ms = 1 second is a simple, safe default:
+
+    smaller timeout → more responsive, more CPU overhead
+
+    larger timeout → less CPU, but alerts may appear delayed*/
+        errbuf
+    );
+
+    if (!handle) {
+        /*!handle means handle is null*/
+        cerr << "Could not open device: " << errbuf << endl;
+        pcap_freealldevs(alldevs);
+        return 1;
+    }
+
+    // We can free device list after opening handle
+    pcap_freealldevs(alldevs);
+
+    cout << "\nIDS started! Press CTRL+C to stop.\n";
+    cout << "Logging alerts to: ids_alerts.log\n\n";
+
+    // Capture forever
+    pcap_loop(handle, 0, packetHandler, NULL);
+
+    pcap_close(handle);
+    return 0;
+}
