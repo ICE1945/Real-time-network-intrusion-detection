@@ -1,0 +1,8 @@
+[ALERT] Large packet (1506 bytes) from 52.104.51.41
+[ALERT] Large packet (1506 bytes) from 52.104.51.41
+[ALERT] Suspicious port access: IP=192.168.1.3 -> Port=3389
+[ALERT] Suspicious port access: IP=192.168.1.3 -> Port=3389
+[ALERT] Large packet (1506 bytes) from 23.55.235.85
+[ALERT] Large packet (1506 bytes) from 23.55.235.85
+[ALERT] Large packet (1506 bytes) from 40.119.249.228
+[ALERT] Large packet (1506 bytes) from 40.119.249.228
